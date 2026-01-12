@@ -87,7 +87,6 @@ fn marquee(text: &str, width: usize, tick: u64) -> String {
 
 fn draw_list<B: Backend>(f: &mut Frame<B>, app: &mut App, area: Rect) {
     let inner_width = area.width.saturating_sub(4) as usize;
-    // 2 border + 2 prefix
 
     let items: Vec<ListItem> = app.tracks
         .iter()
@@ -104,7 +103,20 @@ fn draw_list<B: Backend>(f: &mut Frame<B>, app: &mut App, area: Rect) {
                 truncate(&t.title, available)
             };
 
-            ListItem::new(format!("{}{}", prefix, title))
+            ListItem::new(Spans::from(vec![
+                // prefix (normal)
+                Span::raw(prefix),
+
+                // title (bold)
+                Span::styled(
+                    title,
+                    if selected {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    },
+                ),
+            ]))
         })
         .collect();
 
