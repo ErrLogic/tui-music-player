@@ -12,12 +12,12 @@ use crossterm::{
 };
 use tui::{Terminal, backend::CrosstermBackend};
 use std::{
-    io, 
+    io,
     time::{Duration, Instant}
 };
 use app::App;
 use ui::{
-    render::draw_ui, 
+    render::draw_ui,
     screens::Screen
 };
 
@@ -54,13 +54,18 @@ fn main() -> Result<()> {
                         }
                     }
 
-                    KeyCode::Enter if matches!(app.ui_screen, Screen::TrackList) => {
-                        app.play_selected()?;
-                        app.ui_screen = Screen::Player;
+                    KeyCode::Enter | KeyCode::Char(' ') => {
+                        match app.ui_screen {
+                            Screen::TrackList => {
+                                app.play_selected()?;
+                                app.ui_screen = Screen::Player;
+                            }
+                            Screen::Player => {
+                                app.audio.toggle();
+                            }
+                        }
                     }
-
-                    KeyCode::Char(' ') => app.audio.toggle(),
-
+                    
                     KeyCode::Down => {
                         app.selected = (app.selected + 1).min(app.tracks.len().saturating_sub(1));
                     }
