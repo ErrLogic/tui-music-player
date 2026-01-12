@@ -12,7 +12,7 @@ use std::f64::consts::PI;
 use crate::app::App;
 use crate::ui::screens::Screen;
 
-pub fn draw_ui<B: Backend>(f: &mut Frame<B>, app: &App) {
+pub fn draw_ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     let size = f.size();
     let compact = size.width < 50 || size.height < 18;
 
@@ -23,7 +23,7 @@ pub fn draw_ui<B: Backend>(f: &mut Frame<B>, app: &App) {
     }
 }
 
-fn draw_full_ui<B: Backend>(f: &mut Frame<B>, app: &App) {
+fn draw_full_ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -46,7 +46,7 @@ fn draw_full_ui<B: Backend>(f: &mut Frame<B>, app: &App) {
 }
 
 
-fn draw_mini_ui<B: Backend>(f: &mut Frame<B>, app: &App) {
+fn draw_mini_ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     let area = f.size();
 
     match app.ui_screen {
@@ -85,7 +85,7 @@ fn marquee(text: &str, width: usize, tick: u64) -> String {
     out
 }
 
-fn draw_list<B: Backend>(f: &mut Frame<B>, app: &App, area: Rect) {
+fn draw_list<B: Backend>(f: &mut Frame<B>, app: &mut App, area: Rect) {
     let inner_width = area.width.saturating_sub(4) as usize;
     // 2 border + 2 prefix
 
@@ -111,7 +111,7 @@ fn draw_list<B: Backend>(f: &mut Frame<B>, app: &App, area: Rect) {
     let list = List::new(items)
         .block(Block::default().title("Tracks").borders(Borders::ALL));
 
-    f.render_widget(list, area);
+    f.render_stateful_widget(list, area, &mut app.list_state);
 }
 
 fn draw_player<B: Backend>(f: &mut Frame<B>, app: &App, area: Rect) {

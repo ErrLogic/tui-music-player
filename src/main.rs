@@ -35,7 +35,7 @@ fn main() -> Result<()> {
     let mut last_tick = Instant::now();
 
     loop {
-        terminal.draw(|f| draw_ui(f, &app))?;
+        terminal.draw(|f| draw_ui(f, &mut app))?;
 
         // === INPUT ===
         let timeout = tick_rate
@@ -65,13 +65,15 @@ fn main() -> Result<()> {
                             }
                         }
                     }
-                    
+
                     KeyCode::Down => {
                         app.selected = (app.selected + 1).min(app.tracks.len().saturating_sub(1));
+                        app.list_state.select(Some(app.selected));
                     }
 
                     KeyCode::Up => {
                         app.selected = app.selected.saturating_sub(1);
+                        app.list_state.select(Some(app.selected));
                     }
 
                     KeyCode::Right => {

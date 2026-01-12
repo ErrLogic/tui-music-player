@@ -1,7 +1,7 @@
 use anyhow::Result;
 use walkdir::WalkDir;
 use std::path::PathBuf;
-
+use tui::widgets::ListState;
 use crate::{track::Track, audio::AudioEngine, playback::PlaybackState};
 use crate::ui::screens::Screen;
 
@@ -14,6 +14,7 @@ pub struct App {
     pub selected: usize,
 
     pub tick: u64,
+    pub list_state: ListState,
 }
 
 impl App {
@@ -31,6 +32,9 @@ impl App {
 
         tracks.sort_by(|a, b| a.title.cmp(&b.title));
 
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+
         Ok(Self {
             audio: AudioEngine::new()?,
             playback: PlaybackState::new(),
@@ -38,6 +42,7 @@ impl App {
             selected: 0,
             tracks,
             tick: 0,
+            list_state,
         })
     }
 
