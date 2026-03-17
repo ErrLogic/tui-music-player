@@ -1,144 +1,305 @@
 use anyhow::Result;
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
 use std::{
-    fs::File,
-    io::BufReader,
     path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        mpsc::{self, Sender},
+        Arc,
+    },
+    thread,
     time::{Duration, Instant},
 };
+use std::sync::Mutex;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use ringbuf::{HeapRb, traits::*};
+
+use symphonia::core::{
+    audio::AudioBufferRef,
+    formats::FormatOptions,
+    io::MediaSourceStream,
+    meta::MetadataOptions,
+    probe::Hint,
+};
+use symphonia::core::audio::Signal;
+use symphonia::default::{get_codecs, get_probe};
+
+// ================= COMMAND =================
+
+pub enum AudioCommand {
+    Load(PathBuf),
+    Play,
+    Stop,
+    Toggle,
+    Volume(f32),
+}
+
+// ================= ENGINE =================
 
 pub struct AudioEngine {
-    sink: Option<Sink>,
-    _stream: OutputStream,
-    handle: OutputStreamHandle,
+    tx: Sender<AudioCommand>,
 
-    is_playing: bool,
-    volume: f32,
+    playing: Arc<AtomicBool>,
+    volume: Arc<AtomicU32>,
 
-    started_at: Option<Instant>,
-    paused_at: Duration,
+    start_time: Arc<Mutex<Option<Instant>>>,
 }
 
 impl AudioEngine {
     pub fn new() -> Result<Self> {
-        let (stream, handle) = OutputStream::try_default()?;
+        let (tx, rx) = mpsc::channel();
+
+        let playing = Arc::new(AtomicBool::new(false));
+        let volume = Arc::new(AtomicU32::new(20));
+
+        let start_time = Arc::new(Mutex::new(None));
+
+        thread::spawn({
+            let playing = playing.clone();
+            let volume = volume.clone();
+            let start_time = start_time.clone();
+
+            move || run_audio_thread(rx, playing, volume, start_time)
+        });
+
         Ok(Self {
-            sink: None,
-            _stream: stream,
-            handle,
-            is_playing: false,
-            volume: 0.2,
-            started_at: None,
-            paused_at: Duration::ZERO,
+            tx,
+            playing,
+            volume,
+            start_time,
         })
     }
 
-    pub fn load(&mut self, path: &PathBuf) -> Result<()> {
-        self.stop();
+    // ===== API sesuai UI =====
 
-        let file = BufReader::new(File::open(path)?);
-        let source = Decoder::new(file)?;
-
-        let sink = Sink::try_new(&self.handle)?;
-        sink.append(source);
-        sink.pause();
-        sink.set_volume(self.volume);
-
-        self.sink = Some(sink);
-        self.started_at = None;
-        self.paused_at = Duration::ZERO;
-        self.is_playing = false;
-
+    pub fn load(&self, path: &PathBuf) -> Result<()> {
+        self.tx.send(AudioCommand::Load(path.clone()))?;
         Ok(())
     }
 
-    pub fn play(&mut self) {
-        if let Some(sink) = &self.sink {
-            if !self.is_playing {
-                sink.play();
-                self.started_at = Some(Instant::now());
-                self.is_playing = true;
-            }
-        }
+    pub fn play(&self) {
+        let _ = self.tx.send(AudioCommand::Play);
     }
 
-    pub fn pause(&mut self) {
-        if let Some(sink) = &self.sink {
-            if self.is_playing {
-                sink.pause();
-                if let Some(start) = self.started_at {
-                    self.paused_at += start.elapsed();
-                }
-                self.started_at = None;
-                self.is_playing = false;
-            }
-        }
+    pub fn stop(&self) {
+        let _ = self.tx.send(AudioCommand::Stop);
     }
 
-    pub fn toggle(&mut self) {
-        if self.is_playing {
-            self.pause();
-        } else {
-            self.play();
-        }
+    pub fn toggle(&self) {
+        let _ = self.tx.send(AudioCommand::Toggle);
     }
 
-    pub fn stop(&mut self) {
-        if let Some(sink) = &self.sink {
-            sink.stop();
-        }
-        self.sink = None;
-        self.started_at = None;
-        self.paused_at = Duration::ZERO;
-        self.is_playing = false;
+    pub fn volume_up(&self) {
+        let v = self.volume();
+        let _ = self.tx.send(AudioCommand::Volume(v + 0.1));
     }
 
-    // ===== READ-ONLY API (for UI) =====
-
-    pub fn is_paused(&self) -> bool {
-        !self.is_playing
+    pub fn volume_down(&self) {
+        let v = self.volume();
+        let _ = self.tx.send(AudioCommand::Volume(v - 0.1));
     }
 
     pub fn volume(&self) -> f32 {
-        self.volume
+        self.volume.load(Ordering::Relaxed) as f32 / 100.0
+    }
+
+    pub fn is_paused(&self) -> bool {
+        !self.playing.load(Ordering::Relaxed)
     }
 
     pub fn elapsed(&self) -> Duration {
-        match (self.is_playing, self.started_at) {
-            (true, Some(start)) => self.paused_at + start.elapsed(),
-            _ => self.paused_at,
+        if let Some(start) = *self.start_time.lock().unwrap() {
+            start.elapsed()
+        } else {
+            Duration::ZERO
         }
     }
 
     pub fn finished(&self) -> bool {
-        self.sink.as_ref().map(|s| s.empty()).unwrap_or(false)
+        false // simple dulu
     }
 
-    pub fn finalize_if_finished(&mut self) -> bool {
-        if let Some(s) = &self.sink {
-            if s.empty() {
-                self.is_playing = false;
-                self.started_at = None;
-                return true;
-            }
-        }
+    pub fn finalize_if_finished(&self) -> bool {
         false
     }
+}
 
-    // ===== COMMAND API =====
+fn run_audio_thread(
+    rx: mpsc::Receiver<AudioCommand>,
+    playing: Arc<AtomicBool>,
+    volume: Arc<AtomicU32>,
+    start_time: Arc<Mutex<Option<Instant>>>,
+) {
+    let host = cpal::default_host();
+    let device = host.default_output_device().expect("no device");
 
-    pub fn volume_up(&mut self) {
-        self.set_volume(self.volume + 0.1);
+    let config = device.default_output_config().unwrap();
+    let sample_rate = config.sample_rate() as usize;
+    let channels = config.channels() as usize;
+
+    let rb = HeapRb::<f32>::new(sample_rate * channels * 2);
+    let (producer, consumer) = rb.split();
+    let producer = Arc::new(Mutex::new(producer));
+
+    let cb_playing = playing.clone();
+    let cb_volume = volume.clone();
+    let mut cb_consumer = consumer;
+    let started = Arc::new(AtomicBool::new(false));
+    let cb_started = started.clone();
+
+    let stream = device.build_output_stream(
+        &config.into(),
+        move |data: &mut [f32], _| {
+            let vol = cb_volume.load(Ordering::Relaxed) as f32 / 100.0;
+            let is_playing = cb_playing.load(Ordering::Relaxed);
+
+            if !cb_started.load(Ordering::Relaxed) {
+                if cb_consumer.occupied_len() < data.len() * 2 {
+                    for s in data.iter_mut() {
+                        *s = 0.0;
+                    }
+                    return;
+                }
+                cb_started.store(true, Ordering::Relaxed);
+            }
+
+            for sample in data.iter_mut() {
+                if is_playing {
+                    *sample = cb_consumer.try_pop().unwrap_or(0.0) * vol;
+                } else {
+                    *sample = 0.0;
+                }
+            }
+        },
+        move |err| eprintln!("audio error: {:?}", err),
+        None,
+    ).unwrap();
+
+    stream.play().unwrap();
+
+    let mut stop_flag: Option<Arc<AtomicBool>> = None;
+
+    loop {
+        if let Ok(cmd) = rx.recv() {
+            match cmd {
+                AudioCommand::Load(path) => {
+                    if let Some(flag) = stop_flag.take() {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+
+                    let stop = Arc::new(AtomicBool::new(false));
+                    stop_flag = Some(stop.clone());
+
+                    let prod = producer.clone();
+
+                    thread::spawn(move || {
+                        decode_file(path, prod, stop);
+                    });
+
+                    *start_time.lock().unwrap() = Some(Instant::now());
+                }
+
+                AudioCommand::Play => {
+                    playing.store(true, Ordering::Relaxed);
+                }
+
+                AudioCommand::Stop => {
+                    playing.store(false, Ordering::Relaxed);
+                }
+
+                AudioCommand::Toggle => {
+                    let v = !playing.load(Ordering::Relaxed);
+                    playing.store(v, Ordering::Relaxed);
+                }
+
+                AudioCommand::Volume(v) => {
+                    let v = (v.clamp(0.0, 2.0) * 100.0) as u32;
+                    volume.store(v, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+fn decode_file(
+    path: PathBuf,
+    producer: Arc<Mutex<impl Producer<Item = f32>>>,
+    stop: Arc<AtomicBool>,
+) {
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension() {
+        hint.with_extension(&ext.to_string_lossy());
     }
 
-    pub fn volume_down(&mut self) {
-        self.set_volume(self.volume - 0.1);
-    }
+    let probed = match get_probe().format(
+        &hint,
+        mss,
+        &FormatOptions::default(),
+        &MetadataOptions::default(),
+    ) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
 
-    fn set_volume(&mut self, v: f32) {
-        self.volume = v.clamp(0.0, 2.0);
-        if let Some(s) = &self.sink {
-            s.set_volume(self.volume);
+    let mut format = probed.format;
+
+    let track = match format.default_track() {
+        Some(t) => t,
+        None => return,
+    };
+
+    let mut decoder = match get_codecs().make(&track.codec_params, &Default::default()) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    while !stop.load(Ordering::Relaxed) {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        match decoded {
+            AudioBufferRef::F32(buf) => {
+                let channels = buf.spec().channels.count();
+                let frames = buf.frames();
+
+                let mut p = producer.lock().unwrap();
+
+                for frame in 0..frames {
+                    for ch in 0..channels {
+                        let sample = buf.chan(ch)[frame];
+                        let _ = p.try_push(sample);
+                    }
+                }
+            }
+
+            AudioBufferRef::S16(buf) => {
+                let channels = buf.spec().channels.count();
+                let frames = buf.frames();
+
+                let mut p = producer.lock().unwrap();
+
+                for frame in 0..frames {
+                    for ch in 0..channels {
+                        let sample = buf.chan(ch)[frame] as f32 / i16::MAX as f32;
+                        let _ = p.try_push(sample);
+                    }
+                }
+            }
+
+            _ => {}
         }
     }
 }

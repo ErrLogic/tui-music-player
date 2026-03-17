@@ -28,7 +28,7 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let music_dir = std::env::args().nth(1).unwrap_or("/home/agx/Music".into());
+    let music_dir = std::env::args().nth(1).unwrap_or("/home/agik/Songs".into());
     let mut app = App::new(music_dir.into())?;
 
     let tick_rate = Duration::from_millis(50);
