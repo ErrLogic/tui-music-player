@@ -4,7 +4,7 @@ use ringbuf::{traits::*, HeapRb};
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Sender},
         Arc,
     },
@@ -36,10 +36,8 @@ pub enum AudioCommand {
 
 pub struct AudioEngine {
     tx: Sender<AudioCommand>,
-
     playing: Arc<AtomicBool>,
     volume: Arc<AtomicU32>,
-
     samples_played: Arc<AtomicU64>,
     sample_rate: usize,
     channels: usize,
@@ -50,6 +48,56 @@ pub struct AudioEngine {
 }
 
 impl AudioEngine {
+    pub fn stop(&self) {
+        let _ = self.tx.send(AudioCommand::Stop);
+    }
+
+    pub fn toggle(&self) {
+        let _ = self.tx.send(AudioCommand::Toggle);
+    }
+
+    pub fn volume(&self) -> f32 {
+        self.volume.load(Ordering::Relaxed) as f32 / 100.0
+    }
+
+    pub fn volume_up(&self) {
+        let v = self.volume();
+        let _ = self.tx.send(AudioCommand::Volume(v + 0.1));
+    }
+
+    pub fn volume_down(&self) {
+        let v = self.volume();
+        let _ = self.tx.send(AudioCommand::Volume(v - 0.1));
+    }
+
+    pub fn is_paused(&self) -> bool {
+        !self.playing.load(Ordering::Relaxed)
+    }
+
+    pub fn underruns(&self) -> u64 {
+        self.underrun_count.load(Ordering::Relaxed)
+    }
+
+    pub fn finished(&self) -> bool {
+        self.finished_flag.load(Ordering::Relaxed)
+            && self.buffer_empty_flag.load(Ordering::Relaxed)
+    }
+
+    pub fn finalize_if_finished(&self) -> bool {
+        if self.finished() {
+            self.playing.store(false, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        let samples = self.samples_played.load(Ordering::Relaxed);
+        let frames = samples / self.channels as u64;
+        let seconds = frames as f64 / self.sample_rate as f64;
+        Duration::from_secs_f64(seconds)
+    }
+
     pub fn new() -> Result<Self> {
         let (tx, rx) = mpsc::channel();
 
@@ -100,29 +148,6 @@ impl AudioEngine {
         })
     }
 
-    pub fn is_paused(&self) -> bool {
-        !self.playing.load(Ordering::Relaxed)
-    }
-
-    pub fn volume(&self) -> f32 {
-        self.volume.load(Ordering::Relaxed) as f32 / 100.0
-    }
-
-    pub fn volume_up(&self) {
-        let v = self.volume();
-        let _ = self.tx.send(AudioCommand::Volume(v + 0.1));
-    }
-
-    pub fn volume_down(&self) {
-        let v = self.volume();
-        let _ = self.tx.send(AudioCommand::Volume(v - 0.1));
-    }
-
-    pub fn finished(&self) -> bool {
-        self.finished_flag.load(Ordering::Relaxed)
-            && self.buffer_empty_flag.load(Ordering::Relaxed)
-    }
-
     pub fn load(&self, path: &PathBuf) -> Result<()> {
         self.samples_played.store(0, Ordering::Relaxed);
         self.finished_flag.store(false, Ordering::Relaxed);
@@ -135,35 +160,6 @@ impl AudioEngine {
 
     pub fn play(&self) {
         let _ = self.tx.send(AudioCommand::Play);
-    }
-
-    pub fn stop(&self) {
-        let _ = self.tx.send(AudioCommand::Stop);
-    }
-
-    pub fn toggle(&self) {
-        let _ = self.tx.send(AudioCommand::Toggle);
-    }
-
-    pub fn elapsed(&self) -> Duration {
-        let samples = self.samples_played.load(Ordering::Relaxed);
-        let frames = samples / self.channels as u64;
-        let seconds = frames as f64 / self.sample_rate as f64;
-        Duration::from_secs_f64(seconds)
-    }
-
-    pub fn finalize_if_finished(&self) -> bool {
-        if self.finished_flag.load(Ordering::Relaxed)
-            && self.buffer_empty_flag.load(Ordering::Relaxed)
-        {
-            self.playing.store(false, Ordering::Relaxed);
-            return true;
-        }
-        false
-    }
-
-    pub fn underruns(&self) -> u64 {
-        self.underrun_count.load(Ordering::Relaxed)
     }
 }
 
@@ -185,14 +181,21 @@ fn run_audio_thread(
     let sample_rate = config.sample_rate() as usize;
     let channels = config.channels() as usize;
 
-    let rb = HeapRb::<f32>::new(sample_rate * channels * 2);
+    // ❗ buffer x5
+    let rb = HeapRb::<f32>::new(sample_rate * channels * 5);
     let (producer, mut consumer) = rb.split();
+
+    let buffered_samples = Arc::new(AtomicUsize::new(0));
+    let buffered_samples_cb = buffered_samples.clone();
 
     let playing_cb = playing.clone();
     let volume_cb = volume.clone();
-    let buffer_empty_flag_cb2 = buffer_empty_flag.clone();
     let underrun_cb2 = underrun_count.clone();
+
     let samples_played_cb = samples_played.clone();
+    let buffer_empty_flag_cb = buffer_empty_flag.clone();
+
+    let mut stop_flag: Option<Arc<AtomicBool>> = None;
     let reset_flag = Arc::new(AtomicBool::new(false));
     let reset_flag_cb = reset_flag.clone();
 
@@ -206,33 +209,36 @@ fn run_audio_thread(
             let vol = volume_cb.load(Ordering::Relaxed) as f32 / 100.0;
             let is_playing = playing_cb.load(Ordering::Relaxed);
 
+            let mut local_underrun = 0;
             let mut local_samples = 0u64;
-            let mut local_underrun = 0u64;
-
-            let is_empty = consumer.is_empty();
-            buffer_empty_flag_cb2.store(is_empty, Ordering::Relaxed);
 
             for sample in data.iter_mut() {
                 if is_playing {
                     match consumer.try_pop() {
-                        Some(s) => *sample = s * vol,
+                        Some(s) => {
+                            *sample = s * vol;
+                            buffered_samples_cb.fetch_sub(1, Ordering::Relaxed);
+                            local_samples += 1;
+                        }
                         None => {
                             *sample = 0.0;
                             local_underrun += 1;
                         }
                     }
-                    local_samples += 1;
                 } else {
                     *sample = 0.0;
                 }
             }
 
-            if local_samples > 0 {
-                samples_played_cb.fetch_add(local_samples, Ordering::Relaxed);
-            }
+            let is_empty = buffered_samples_cb.load(Ordering::Relaxed) == 0;
+            buffer_empty_flag_cb.store(is_empty, Ordering::Relaxed); // ✅ PAKE INI
 
             if local_underrun > 0 {
                 underrun_cb2.fetch_add(local_underrun, Ordering::Relaxed);
+            }
+
+            if local_samples > 0 {
+                samples_played_cb.fetch_add(local_samples, Ordering::Relaxed);
             }
         },
         move |err| eprintln!("audio error: {:?}", err),
@@ -241,13 +247,13 @@ fn run_audio_thread(
 
     stream.play().unwrap();
 
-    let mut stop_flag: Option<Arc<AtomicBool>> = None;
-    let (decode_tx, decode_rx) = mpsc::channel::<(PathBuf, Arc<AtomicBool>)>();
+    let (decode_tx, decode_rx) = mpsc::channel();
 
-    let mut producer = producer; // move sekali
+    let mut producer = producer;
 
     thread::spawn({
         let finished_flag = finished_flag.clone();
+        let buffered_samples = buffered_samples.clone();
 
         move || {
             while let Ok((path, stop)) = decode_rx.recv() {
@@ -256,8 +262,8 @@ fn run_audio_thread(
                     &mut producer,
                     stop,
                     finished_flag.clone(),
+                    buffered_samples.clone(),
                     sample_rate,
-                    channels,
                 );
             }
         }
@@ -267,59 +273,39 @@ fn run_audio_thread(
         if let Ok(cmd) = rx.recv() {
             match cmd {
                 AudioCommand::Load(path) => {
+                    // 1. STOP playback dulu (paling awal)
+                    playing.store(false, Ordering::Relaxed);
+
+                    // 2. STOP decoder lama
                     if let Some(flag) = stop_flag.take() {
                         flag.store(true, Ordering::Relaxed);
                     }
 
+                    // 3. RESET buffer + counter
                     reset_flag.store(true, Ordering::Relaxed);
+                    buffered_samples.store(0, Ordering::Relaxed); // 🔥 WAJIB
 
+                    // 4. RESET state
                     finished_flag.store(false, Ordering::Relaxed);
-                    playing.store(true, Ordering::Relaxed);
 
+                    // 5. START decoder baru
                     let stop = Arc::new(AtomicBool::new(false));
                     stop_flag = Some(stop.clone());
-
                     let _ = decode_tx.send((path, stop));
-                }
 
+                    // 6. PREFILL (pakai channels)
+                    while buffered_samples.load(Ordering::Relaxed) < sample_rate * channels * 3 {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+
+                    // 7. PLAY lagi
+                    playing.store(true, Ordering::Relaxed);
+                }
                 AudioCommand::Play => playing.store(true, Ordering::Relaxed),
                 AudioCommand::Stop => playing.store(false, Ordering::Relaxed),
-                AudioCommand::Toggle => {
-                    let v = !playing.load(Ordering::Relaxed);
-                    playing.store(v, Ordering::Relaxed);
-                }
-                AudioCommand::Volume(v) => {
-                    volume.store((v.clamp(0.0, 2.0) * 100.0) as u32, Ordering::Relaxed);
-                }
+                _ => {}
             }
         }
-    }
-}
-
-// ================= RESAMPLER =================
-
-fn linear_resample(input: &[f32], ratio: f32, out: &mut Vec<f32>) {
-    let len = input.len();
-    if len < 2 {
-        return;
-    }
-
-    let expected = (len as f32 * ratio) as usize;
-    out.reserve(expected);
-
-    let step = 1.0 / ratio;
-    let mut pos = 0.0;
-
-    while pos < (len - 1) as f32 {
-        let i = pos as usize;
-        let frac = pos - i as f32;
-
-        let a = unsafe { *input.get_unchecked(i) };
-        let b = unsafe { *input.get_unchecked(i + 1) };
-
-        out.push(a + (b - a) * frac);
-
-        pos += step;
     }
 }
 
@@ -330,14 +316,10 @@ fn decode_file(
     producer: &mut impl Producer<Item = f32>,
     stop: Arc<AtomicBool>,
     finished_flag: Arc<AtomicBool>,
+    buffered_samples: Arc<AtomicUsize>,
     device_sr: usize,
-    _device_ch: usize,
 ) {
-    let file = match std::fs::File::open(&path) {
-        Ok(f) => f,
-        Err(_) => return,
-    };
-
+    let file = std::fs::File::open(&path).unwrap();
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
     let mut hint = Hint::new();
@@ -345,15 +327,12 @@ fn decode_file(
         hint.with_extension(&ext.to_string_lossy());
     }
 
-    let probed = match get_probe().format(
+    let probed = get_probe().format(
         &hint,
         mss,
         &FormatOptions::default(),
         &MetadataOptions::default(),
-    ) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
+    ).unwrap();
 
     let mut format = probed.format;
     let track = format.default_track().unwrap();
@@ -365,14 +344,24 @@ fn decode_file(
         .unwrap();
 
     let ratio = device_sr as f32 / src_sr as f32;
-
-    let mut resampled_channels: Vec<Vec<f32>> = Vec::new();
+    let need_resample = src_sr != device_sr;
 
     while !stop.load(Ordering::Relaxed) {
+
+        // 🔥 GUARD 1 (awal loop)
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
         let packet = match format.next_packet() {
             Ok(p) => p,
             Err(_) => break,
         };
+
+        // 🔥 GUARD 2 (setelah I/O)
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
 
         let decoded = match decoder.decode(&packet) {
             Ok(d) => d,
@@ -383,39 +372,70 @@ fn decode_file(
             let ch = buf.spec().channels.count();
             let frames = buf.frames();
 
-            // init sekali, bukan tiap loop
-            if resampled_channels.len() != ch {
-                resampled_channels.clear();
-                resampled_channels.resize_with(ch, || Vec::with_capacity(frames * 2));
-            }
+            let mut per_channel: Vec<Vec<f32>> = Vec::new();
 
             for c in 0..ch {
                 let input = &buf.chan(c)[..frames];
-                let out = &mut resampled_channels[c];
 
-                out.clear();
-                out.reserve(input.len());
+                let samples = if need_resample {
+                    let mut out = Vec::new();
+                    linear_resample(input, ratio, &mut out);
+                    out
+                } else {
+                    input.to_vec()
+                };
 
-                linear_resample(input, ratio, out);
+                per_channel.push(samples);
             }
 
-            let min_len = resampled_channels
-                .iter()
-                .map(|v| v.len())
-                .min()
-                .unwrap_or(0);
+            let min_len = per_channel.iter().map(|v| v.len()).min().unwrap_or(0);
 
             for i in 0..min_len {
-                for c in 0..ch {
-                    let s = resampled_channels[c][i];
 
-                    if producer.try_push(s).is_err() {
-                        continue; // drop
+                // 🔥 GUARD 3 (sebelum inner loop)
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                for c in 0..ch {
+                    let s = per_channel[c][i];
+
+                    while producer.try_push(s).is_err() {
+                        if stop.load(Ordering::Relaxed) {
+                            return; // 🔥 EXIT TOTAL
+                        }
+                        thread::yield_now();
                     }
+
+                    buffered_samples.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
     }
 
     finished_flag.store(true, Ordering::Relaxed);
+}
+
+// ================= RESAMPLER =================
+
+fn linear_resample(input: &[f32], ratio: f32, out: &mut Vec<f32>) {
+    let len = input.len();
+    if len < 2 {
+        return;
+    }
+
+    let step = 1.0 / ratio;
+    let mut pos = 0.0;
+
+    while pos < (len - 1) as f32 {
+        let i = pos as usize;
+        let frac = pos - i as f32;
+
+        let a = input[i];
+        let b = input[i + 1];
+
+        out.push(a + (b - a) * frac);
+
+        pos += step;
+    }
 }
