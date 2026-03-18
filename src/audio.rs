@@ -199,6 +199,9 @@ fn run_audio_thread(
     let reset_flag_cb = reset_flag.clone();
     let finished_flag_cb = finished_flag.clone();
 
+    let mut last_sample = 0.0f32;
+    let mut current_vol = volume.load(Ordering::Relaxed) as f32 / 100.0;
+
     let stream = device.build_output_stream(
         &config.into(),
         move |data: &mut [f32], _| {
@@ -206,33 +209,44 @@ fn run_audio_thread(
                 while consumer.try_pop().is_some() {}
             }
 
-            let vol = volume_cb.load(Ordering::Relaxed) as f32 / 100.0;
-            let is_playing = playing_cb.load(Ordering::Relaxed)
-                && !finished_flag_cb.load(Ordering::Relaxed);
+            let is_playing =
+                playing_cb.load(Ordering::Relaxed)
+                    && !finished_flag_cb.load(Ordering::Relaxed);
+            let target_vol = volume_cb.load(Ordering::Relaxed) as f32 / 100.0;
 
             let mut local_underrun = 0;
             let mut local_samples = 0u64;
 
             for sample in data.iter_mut() {
+                // smoothing
+                current_vol += (target_vol - current_vol) * 0.01;
+
                 if is_playing {
                     match consumer.try_pop() {
                         Some(s) => {
-                            *sample = s * vol;
+                            let out = (s * current_vol).clamp(-1.0, 1.0);
+                            *sample = out;
+                            last_sample = out;
+
                             buffered_samples_cb.fetch_sub(1, Ordering::Relaxed);
                             local_samples += 1;
                         }
                         None => {
-                            *sample = 0.0;
+                            // decay instead of hold
+                            last_sample *= 0.99;
+                            *sample = last_sample;
+
                             local_underrun += 1;
                         }
                     }
                 } else {
-                    *sample = 0.0;
+                    last_sample *= 0.95;
+                    *sample = last_sample;
                 }
             }
 
             let is_empty = buffered_samples_cb.load(Ordering::Relaxed) == 0;
-            buffer_empty_flag_cb.store(is_empty, Ordering::Relaxed); // ✅ PAKE INI
+            buffer_empty_flag_cb.store(is_empty, Ordering::Relaxed);
 
             if local_underrun > 0 {
                 underrun_cb2.fetch_add(local_underrun, Ordering::Relaxed);
@@ -311,7 +325,7 @@ fn run_audio_thread(
                 }
 
                 AudioCommand::Volume(v) => {
-                    volume.store((v.clamp(0.0, 2.0) * 100.0) as u32, Ordering::Relaxed);
+                    volume.store((v.clamp(0.0, 1.0) * 100.0) as u32, Ordering::Relaxed);
                 }
             }
         }

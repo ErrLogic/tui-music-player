@@ -154,7 +154,7 @@ fn draw_player<B: Backend>(f: &mut Frame<B>, app: &App, area: Rect) {
         .split(area);
 
     let status = if app.audio.is_paused() { "⏸ Paused" } else { "▶ Playing" };
-    let vol_pct = (app.audio.volume().clamp(0.0, 2.0) * 50.0) as u16;
+    let vol_pct = (app.audio.volume().clamp(0.0, 1.0) * 100.0) as u32;
     let underruns = app.audio.underruns();
 
     let underrun_text = if underruns > 0 {
@@ -295,7 +295,7 @@ fn draw_compact_player<B: Backend>(f: &mut Frame<B>, app: &App, area: Rect) {
 
     let status = if app.audio.is_paused() { "⏸" } else { "▶" };
 
-    let vol_percent = (app.audio.volume().clamp(0.0, 2.0) * 50.0) as u8;
+    let vol_percent = (app.audio.volume().clamp(0.0, 1.0) * 100.0) as u32;
 
     // === VERTICAL LAYOUT ===
     let chunks = Layout::default()
