@@ -129,7 +129,7 @@ fn draw_list<B: Backend>(f: &mut Frame<B>, app: &mut App, area: Rect) {
 fn draw_player<B: Backend>(f: &mut Frame<B>, app: &App, area: Rect) {
     let track = &app.tracks[app.playback.index];
 
-    let finished = app.audio.finished();
+    let finished = app.audio.take_finished();
     let elapsed = if finished {
         app.playback.duration
     } else {
@@ -285,7 +285,7 @@ fn draw_compact_player<B: Backend>(f: &mut Frame<B>, app: &App, area: Rect) {
     let track = &app.tracks[app.playback.index];
 
     // === TIME STATE (NO SIDE EFFECT) ===
-    let elapsed = if app.audio.finished() {
+    let elapsed = if app.audio.take_finished() {
         app.playback.duration
     } else {
         app.audio.elapsed()

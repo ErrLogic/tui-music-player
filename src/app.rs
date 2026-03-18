@@ -51,13 +51,14 @@ impl App {
         let track = &self.tracks[self.selected];
         self.audio.stop();
         self.audio.load(&track.path)?;
+        self.audio.mark_track_start();
         self.audio.play();
         self.playback.duration = track.duration;
         Ok(())
     }
 
     pub fn auto_next(&mut self) -> Result<()> {
-        if self.audio.finalize_if_finished() {
+        if self.audio.take_finished() {
             let next = (self.playback.index + 1) % self.tracks.len();
             self.selected = next;
             self.play_selected()?;
