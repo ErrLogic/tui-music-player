@@ -61,12 +61,12 @@ impl AudioEngine {
     }
 
     pub fn volume_up(&self) {
-        let v = self.volume();
+        let v = self.volume().clamp(0.0, 2.0);
         let _ = self.tx.send(AudioCommand::Volume(v + 0.1));
     }
 
     pub fn volume_down(&self) {
-        let v = self.volume();
+        let v = self.volume().clamp(0.0, 2.0);
         let _ = self.tx.send(AudioCommand::Volume(v - 0.1));
     }
 
@@ -80,11 +80,10 @@ impl AudioEngine {
 
     pub fn finished(&self) -> bool {
         self.finished_flag.load(Ordering::Relaxed)
-            && self.buffer_empty_flag.load(Ordering::Relaxed)
     }
 
     pub fn finalize_if_finished(&self) -> bool {
-        if self.finished() {
+        if self.finished_flag.swap(false, Ordering::Relaxed) {
             self.playing.store(false, Ordering::Relaxed);
             return true;
         }
@@ -182,7 +181,7 @@ fn run_audio_thread(
     let channels = config.channels() as usize;
 
     // ❗ buffer x5
-    let rb = HeapRb::<f32>::new(sample_rate * channels * 5);
+    let rb = HeapRb::<f32>::new(sample_rate * channels * 10);
     let (producer, mut consumer) = rb.split();
 
     let buffered_samples = Arc::new(AtomicUsize::new(0));
@@ -198,6 +197,7 @@ fn run_audio_thread(
     let mut stop_flag: Option<Arc<AtomicBool>> = None;
     let reset_flag = Arc::new(AtomicBool::new(false));
     let reset_flag_cb = reset_flag.clone();
+    let finished_flag_cb = finished_flag.clone();
 
     let stream = device.build_output_stream(
         &config.into(),
@@ -207,7 +207,8 @@ fn run_audio_thread(
             }
 
             let vol = volume_cb.load(Ordering::Relaxed) as f32 / 100.0;
-            let is_playing = playing_cb.load(Ordering::Relaxed);
+            let is_playing = playing_cb.load(Ordering::Relaxed)
+                && !finished_flag_cb.load(Ordering::Relaxed);
 
             let mut local_underrun = 0;
             let mut local_samples = 0u64;
@@ -241,7 +242,7 @@ fn run_audio_thread(
                 samples_played_cb.fetch_add(local_samples, Ordering::Relaxed);
             }
         },
-        move |err| eprintln!("audio error: {:?}", err),
+        move |_err| {},
         None,
     ).unwrap();
 
@@ -294,7 +295,7 @@ fn run_audio_thread(
                     let _ = decode_tx.send((path, stop));
 
                     // 6. PREFILL (pakai channels)
-                    while buffered_samples.load(Ordering::Relaxed) < sample_rate * channels * 3 {
+                    while buffered_samples.load(Ordering::Relaxed) < sample_rate * channels * 5 {
                         thread::sleep(Duration::from_millis(10));
                     }
 
@@ -303,7 +304,15 @@ fn run_audio_thread(
                 }
                 AudioCommand::Play => playing.store(true, Ordering::Relaxed),
                 AudioCommand::Stop => playing.store(false, Ordering::Relaxed),
-                _ => {}
+
+                AudioCommand::Toggle => {
+                    let v = !playing.load(Ordering::Relaxed);
+                    playing.store(v, Ordering::Relaxed);
+                }
+
+                AudioCommand::Volume(v) => {
+                    volume.store((v.clamp(0.0, 2.0) * 100.0) as u32, Ordering::Relaxed);
+                }
             }
         }
     }
