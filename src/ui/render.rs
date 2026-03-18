@@ -155,6 +155,13 @@ fn draw_player<B: Backend>(f: &mut Frame<B>, app: &App, area: Rect) {
 
     let status = if app.audio.is_paused() { "⏸ Paused" } else { "▶ Playing" };
     let vol_pct = (app.audio.volume().clamp(0.0, 2.0) * 50.0) as u16;
+    let underruns = app.audio.underruns();
+
+    let underrun_text = if underruns > 0 {
+        format!("⚠ {}", underruns)
+    } else {
+        "OK".to_string()
+    };
 
     let title_width = layout[0].width.saturating_sub(4) as usize;
 
@@ -173,6 +180,8 @@ fn draw_player<B: Backend>(f: &mut Frame<B>, app: &App, area: Rect) {
             Span::styled(status, Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("    "),
             Span::raw(format!("Vol {:>3}%", vol_pct)),
+            Span::raw("    "),
+            Span::raw(format!("Buf {}", underrun_text)),
         ]),
     ])
         .block(Block::default().title("Now Playing").borders(Borders::ALL));
@@ -337,8 +346,15 @@ fn draw_compact_player<B: Backend>(f: &mut Frame<B>, app: &App, area: Rect) {
     let time = Paragraph::new(time_text)
         .alignment(Alignment::Left);
 
-    let vol = Paragraph::new(format!("Vol {}%", vol_percent))
-        .alignment(Alignment::Right);
+    let underruns = app.audio.underruns();
+
+    let vol = Paragraph::new(
+        if underruns > 0 {
+            format!("Vol {}% ⚠{}", vol_percent, underruns)
+        } else {
+            format!("Vol {}%", vol_percent)
+        }
+    ).alignment(Alignment::Right);
 
     f.render_widget(time, info_chunks[0]);
     f.render_widget(vol, info_chunks[1]);
